@@ -11,9 +11,10 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.config import get_config
+from src.services.agent_model_service import list_agent_model_deployments
 
 # Tool name -> Chinese display name mapping
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
@@ -55,6 +56,31 @@ class StrategyInfo(BaseModel):
 
 class StrategiesResponse(BaseModel):
     strategies: List[StrategyInfo]
+
+
+class AgentModelDeployment(BaseModel):
+    deployment_id: str
+    model: str
+    provider: str
+    source: str
+    api_base: Optional[str] = None
+    deployment_name: Optional[str] = None
+    is_primary: bool = False
+    is_fallback: bool = False
+
+
+class AgentModelsResponse(BaseModel):
+    models: List[AgentModelDeployment]
+
+
+@router.get("/models", response_model=AgentModelsResponse)
+async def get_agent_models():
+    """Get configured Agent model deployments for frontend selection."""
+    config = get_config()
+    return AgentModelsResponse(
+        models=[AgentModelDeployment(**item) for item in list_agent_model_deployments(config)]
+    )
+
 
 @router.get("/strategies", response_model=StrategiesResponse)
 async def get_strategies():
@@ -105,6 +131,74 @@ async def agent_chat(request: ChatRequest):
         logger.error(f"Agent chat API failed: {e}")
         logger.exception("Agent chat error details:")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class SessionItem(BaseModel):
+    session_id: str
+    title: str
+    message_count: int
+    created_at: Optional[str] = None
+    last_active: Optional[str] = None
+
+class SessionsResponse(BaseModel):
+    sessions: List[SessionItem]
+
+class SessionMessagesResponse(BaseModel):
+    session_id: str
+    messages: List[Dict[str, Any]]
+
+
+@router.get("/chat/sessions", response_model=SessionsResponse)
+async def list_chat_sessions(limit: int = 50):
+    """获取聊天会话列表"""
+    from src.storage import get_db
+    sessions = get_db().get_chat_sessions(limit=limit)
+    return SessionsResponse(sessions=sessions)
+
+
+@router.get("/chat/sessions/{session_id}", response_model=SessionMessagesResponse)
+async def get_chat_session_messages(session_id: str, limit: int = 100):
+    """获取单个会话的完整消息"""
+    from src.storage import get_db
+    messages = get_db().get_conversation_messages(session_id, limit=limit)
+    return SessionMessagesResponse(session_id=session_id, messages=messages)
+
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """删除指定会话"""
+    from src.storage import get_db
+    count = get_db().delete_conversation_session(session_id)
+    return {"deleted": count}
+
+
+class SendChatRequest(BaseModel):
+    """Request body for sending chat content to notification channels."""
+
+    content: str = Field(..., min_length=1, max_length=50000)
+    title: Optional[str] = None
+
+
+@router.post("/chat/send")
+async def send_chat_to_notification(request: SendChatRequest):
+    """
+    Send chat session content to configured notification channels.
+    Uses run_in_executor to avoid blocking the event loop.
+    """
+    from src.notification import NotificationService
+
+    loop = asyncio.get_running_loop()
+    success = await loop.run_in_executor(
+        None,
+        lambda: NotificationService().send(request.content),
+    )
+    if not success:
+        return {
+            "success": False,
+            "error": "no_channels",
+            "message": "未配置通知渠道，请先在设置中配置",
+        }
+    return {"success": True}
 
 
 def _build_executor(config, skills: Optional[List[str]] = None):
